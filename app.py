@@ -3,6 +3,7 @@ import bluetooth
 import pyautogui
 
 def main():
+    # Configura socket Bluetooth
     server = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
     server.bind(("", 4))
     server.listen(1)
@@ -16,8 +17,10 @@ def main():
         while True:
             data = client.recv(1024)
             if data:
-                pyautogui.click()
-                client.send(b"clique_ok")
+                # Digita o número
+                pyautogui.write("956523332")
+                print("Digitado: 956523332")
+                client.send(b"digitado_ok")
         
         client.close()
 
