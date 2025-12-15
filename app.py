@@ -1,115 +1,16 @@
 #!/usr/bin/env python3
-import dbus
-import dbus.service
-import dbus.mainloop.glib
-from gi.repository import GLib
 import evdev
-from evdev import ecodes, InputDevice
+from evdev import ecodes, InputDevice, UInput
 import threading
 import time
-import queue
 import subprocess
 import os
 import signal
 import sys
-
-# Configurar DBus
-dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-bus = dbus.SystemBus()
-
-class BluetoothHIDDevice:
-    """Implementa um dispositivo HID Bluetooth (teclado/mouse)"""
-    
-    # UUIDs do serviço HID
-    HID_SERVICE_UUID = "00001124-0000-1000-8000-00805f9b34fb"
-    HID_DESCRIPTOR = [
-        0x05, 0x01,        # Usage Page (Generic Desktop)
-        0x09, 0x06,        # Usage (Keyboard)
-        0xa1, 0x01,        # Collection (Application)
-        0x85, 0x01,        #   Report ID (1)
-        0x05, 0x07,        #   Usage Page (Key Codes)
-        0x19, 0xe0,        #   Usage Minimum (224)
-        0x29, 0xe7,        #   Usage Maximum (231)
-        0x15, 0x00,        #   Logical Minimum (0)
-        0x25, 0x01,        #   Logical Maximum (1)
-        0x75, 0x01,        #   Report Size (1)
-        0x95, 0x08,        #   Report Count (8)
-        0x81, 0x02,        #   Input (Data, Variable, Absolute)
-        0x95, 0x01,        #   Report Count (1)
-        0x75, 0x08,        #   Report Size (8)
-        0x81, 0x01,        #   Input (Constant)
-        0x95, 0x05,        #   Report Count (5)
-        0x75, 0x01,        #   Report Size (1)
-        0x05, 0x08,        #   Usage Page (LEDs)
-        0x19, 0x01,        #   Usage Minimum (1)
-        0x29, 0x05,        #   Usage Maximum (5)
-        0x91, 0x02,        #   Output (Data, Variable, Absolute)
-        0x95, 0x01,        #   Report Count (1)
-        0x75, 0x03,        #   Report Size (3)
-        0x91, 0x01,        #   Output (Constant)
-        0x95, 0x06,        #   Report Count (6)
-        0x75, 0x08,        #   Report Size (8)
-        0x15, 0x00,        #   Logical Minimum (0)
-        0x25, 0x65,        #   Logical Maximum (101)
-        0x05, 0x07,        #   Usage Page (Key Codes)
-        0x19, 0x00,        #   Usage Minimum (0)
-        0x29, 0x65,        #   Usage Maximum (101)
-        0x81, 0x00,        #   Input (Data, Array)
-        0xc0,              # End Collection
-        0x05, 0x01,        # Usage Page (Generic Desktop)
-        0x09, 0x02,        # Usage (Mouse)
-        0xa1, 0x01,        # Collection (Application)
-        0x85, 0x02,        #   Report ID (2)
-        0x09, 0x01,        #   Usage (Pointer)
-        0xa1, 0x00,        #   Collection (Physical)
-        0x05, 0x09,        #     Usage Page (Buttons)
-        0x19, 0x01,        #     Usage Minimum (1)
-        0x29, 0x03,        #     Usage Maximum (3)
-        0x15, 0x00,        #     Logical Minimum (0)
-        0x25, 0x01,        #     Logical Maximum (1)
-        0x95, 0x03,        #     Report Count (3)
-        0x75, 0x01,        #     Report Size (1)
-        0x81, 0x02,        #     Input (Data, Variable, Absolute)
-        0x95, 0x01,        #     Report Count (1)
-        0x75, 0x05,        #     Report Size (5)
-        0x81, 0x01,        #     Input (Constant)
-        0x05, 0x01,        #     Usage Page (Generic Desktop)
-        0x09, 0x30,        #     Usage (X)
-        0x09, 0x31,        #     Usage (Y)
-        0x09, 0x38,        #     Usage (Wheel)
-        0x15, 0x81,        #     Logical Minimum (-127)
-        0x25, 0x7f,        #     Logical Maximum (127)
-        0x75, 0x08,        #     Report Size (8)
-        0x95, 0x03,        #     Report Count (3)
-        0x81, 0x06,        #     Input (Data, Variable, Relative)
-        0xc0,              #   End Collection
-        0xc0               # End Collection
-    ]
-
-class HIDService(dbus.service.Object):
-    """Serviço HID Bluetooth"""
-    
-    def __init__(self, bus, path, name):
-        super().__init__(bus, path)
-        self.name = name
-        self.clients = {}
-        
-    @dbus.service.method("org.bluez.Profile1", in_signature="", out_signature="")
-    def Release(self):
-        print("HID Profile released")
-        
-    @dbus.service.method("org.bluez.Profile1", in_signature="oha{sv}", out_signature="")
-    def NewConnection(self, device, fd, properties):
-        print(f"New connection from {device}")
-        self.clients[device] = fd
-        os.write(fd[0], b"Connection established\n")
-        
-    @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
-    def RequestDisconnection(self, device):
-        print(f"Disconnection requested for {device}")
-        if device in self.clients:
-            os.close(self.clients[device][0])
-            del self.clients[device]
+import select
+import socket
+import json
+import struct
 
 class MacHIDController:
     """Controla o Raspberry Pi como dispositivo HID para Mac"""
@@ -118,12 +19,19 @@ class MacHIDController:
         self.keyboard_device = None
         self.mouse_device = None
         self.running = False
-        self.event_queue = queue.Queue()
+        
+        # Dispositivos virtuais para enviar para o Mac
+        self.virtual_keyboard = None
+        self.virtual_mouse = None
         
         # Estado do HID
         self.modifier_keys = 0x00
         self.keyboard_keys = [0x00] * 6
         self.mouse_buttons = 0x00
+        
+        # Socket para comunicação com Mac
+        self.socket = None
+        self.client_socket = None
         
         # Mapeamento de teclas HID
         self.key_map = {
@@ -180,126 +88,38 @@ class MacHIDController:
             ecodes.KEY_RIGHTMETA: 0x80,
         }
         
-    def setup_bluetooth_hid(self):
-        """Configura o Raspberry Pi como dispositivo HID Bluetooth"""
-        print("🔧 Configurando Raspberry Pi como dispositivo HID Bluetooth...")
+        # Inverte o mapeamento para uso posterior
+        self.hid_to_evdev = {v: k for k, v in self.key_map.items()}
+        self.modifier_to_evdev = {v: k for k, v in self.modifier_map.items()}
+    
+    def setup_bluetooth_simple(self):
+        """Configuração simples do Bluetooth para pareamento"""
+        print("🔧 Configurando Bluetooth...")
         
         try:
-            # 1. Parar serviços Bluetooth existentes
+            # Parar serviços que podem interferir
             subprocess.run(["sudo", "systemctl", "stop", "bluetooth"], check=False)
-            subprocess.run(["sudo", "hciconfig", "hci0", "down"], check=False)
+            time.sleep(1)
             
-            # 2. Configurar dispositivo HID via BlueZ
-            # Instalar dependências se necessário
-            print("📦 Verificando dependências...")
-            
-            # 3. Configurar SDP (Service Discovery Protocol)
-            sdp_record = f"""
-<?xml version="1.0" encoding="UTF-8"?>
-<record>
-  <attribute id="0x0001">
-    <sequence>
-      <uuid value="0x1124"/>
-    </sequence>
-  </attribute>
-  <attribute id="0x0004">
-    <sequence>
-      <sequence>
-        <uuid value="0x0100"/>
-        <uint16 value="0x0011"/>
-      </sequence>
-      <sequence>
-        <uuid value="0x0011"/>
-      </sequence>
-    </sequence>
-  </attribute>
-  <attribute id="0x0005">
-    <sequence>
-      <uuid value="0x1002"/>
-    </sequence>
-  </attribute>
-  <attribute id="0x0006">
-    <sequence>
-      <uint16 value="0x656e"/>
-      <uint16 value="0x006a"/>
-      <uint16 value="0x0100"/>
-    </sequence>
-  </attribute>
-  <attribute id="0x0009">
-    <sequence>
-      <uuid value="0x1124"/>
-      <uint16 value="0x0100"/>
-    </sequence>
-  </attribute>
-  <attribute id="0x000d">
-    <sequence>
-      <sequence>
-        <uuid value="0x1124"/>
-        <uint16 value="0x0100"/>
-      </sequence>
-    </sequence>
-  </attribute>
-  <attribute id="0x0100">
-    <text value="Raspberry Pi HID"/>
-  </attribute>
-  <attribute id="0x0101">
-    <text value="Teclado e Mouse Virtual"/>
-  </attribute>
-  <attribute id="0x0102">
-    <text value="Raspberry Pi"/>
-  </attribute>
-  <attribute id="0x0200">
-    <uint16 value="0x0100"/>
-  </attribute>
-  <attribute id="0x0201">
-    <uint16 value="0x0111"/>
-  </attribute>
-  <attribute id="0x0202">
-    <uint8 value="0xc0"/>
-  </attribute>
-  <attribute id="0x0203">
-    <uint8 value="{len(BluetoothHIDDevice.HID_DESCRIPTOR)}"/>
-    <sequence>
-      {' '.join([f'<uint8 value="0x{b:02x}"/>' for b in BluetoothHIDDevice.HID_DESCRIPTOR])}
-    </sequence>
-  </attribute>
-  <attribute id="0x0204">
-    <sequence>
-      <uint8 value="0x22"/>
-      <text encoding="hex" value="0100"/>
-    </sequence>
-  </attribute>
-  <attribute id="0x0205">
-    <sequence>
-      <uint8 value="0x22"/>
-      <text encoding="hex" value="0200"/>
-    </sequence>
-  </attribute>
-</record>
-"""
-            
-            # Salvar registro SDP
-            with open("/tmp/hid_record.xml", "w") as f:
-                f.write(sdp_record)
-            
-            # 4. Registrar serviço HID
-            print("📝 Registrando serviço HID...")
-            subprocess.run(["sudo", "sdptool", "add", "--channel=1", "HID"], check=False)
-            
-            # 5. Ativar modo compatível com HID
-            subprocess.run(["sudo", "hciconfig", "hci0", "class", "0x002540"], check=False)
-            subprocess.run(["sudo", "hciconfig", "hci0", "name", "Raspberry Pi HID"], check=False)
-            subprocess.run(["sudo", "hciconfig", "hci0", "piscan"], check=False)
+            # Ativar interface Bluetooth
             subprocess.run(["sudo", "hciconfig", "hci0", "up"], check=False)
+            subprocess.run(["sudo", "hciconfig", "hci0", "piscan"], check=False)
+            subprocess.run(["sudo", "hciconfig", "hci0", "name", "Raspberry Pi Remote"], check=False)
             
-            # 6. Mostrar informações
-            print("\n✅ Raspberry Pi configurado como dispositivo HID")
-            print("📡 Endereço Bluetooth:", self.get_bluetooth_address())
-            print("🔍 Nome: Raspberry Pi HID")
-            print("\n💡 No seu Mac:")
-            print("   1. Vá em  > Preferências do Sistema > Bluetooth")
-            print("   2. Procure por 'Raspberry Pi HID'")
-            print("   3. Clique em 'Conectar'")
+            # Obter endereço MAC
+            result = subprocess.run(["hciconfig", "hci0"], capture_output=True, text=True)
+            mac_address = "Desconhecido"
+            for line in result.stdout.split('\n'):
+                if 'BD Address' in line:
+                    mac_address = line.split()[-1]
+                    break
+            
+            print(f"📡 Bluetooth ativado: {mac_address}")
+            print(f"📛 Nome: Raspberry Pi Remote")
+            
+            # Iniciar agente Bluetooth para pareamento
+            print("🤝 Agente de pareamento iniciado (pincode: 0000)")
+            self.start_bluetooth_agent()
             
             return True
             
@@ -307,16 +127,169 @@ class MacHIDController:
             print(f"❌ Erro na configuração Bluetooth: {e}")
             return False
     
-    def get_bluetooth_address(self):
-        """Obtém endereço Bluetooth do Raspberry Pi"""
+    def start_bluetooth_agent(self):
+        """Inicia agente Bluetooth para pareamento"""
+        agent_script = '''
+#!/usr/bin/python3
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+import sys
+
+class Agent(dbus.service.Object):
+    def __init__(self, bus, path):
+        super().__init__(bus, path)
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        print("Agent released")
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        print(f"AuthorizeService: {device}, {uuid}")
+        return
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        print(f"RequestPinCode: {device}")
+        return "0000"
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        print(f"RequestConfirmation: {device}, {passkey}")
+        return
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        print(f"RequestAuthorization: {device}")
+        return
+    
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="u")
+    def Capabilities(self, device, capability):
+        print(f"Capabilities: {device}, {capability}")
+        return 1
+
+if __name__ == "__main__":
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    
+    # Registrar agente
+    agent = Agent(bus, "/test/agent")
+    obj = bus.get_object("org.bluez", "/org/bluez")
+    manager = dbus.Interface(obj, "org.bluez.AgentManager1")
+    manager.RegisterAgent("/test/agent", "DisplayYesNo")
+    manager.RequestDefaultAgent("/test/agent")
+    
+    print("Agent registered successfully")
+    
+    # Manter o agente ativo
+    loop = GLib.MainLoop()
+    loop.run()
+'''
+        
+        # Salvar e executar agente em background
+        with open('/tmp/bluetooth_agent.py', 'w') as f:
+            f.write(agent_script)
+        
+        # Dar permissão e executar
+        subprocess.Popen(['python3', '/tmp/bluetooth_agent.py'], 
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL)
+        time.sleep(2)
+    
+    def setup_tcp_server(self):
+        """Configura servidor TCP para comunicação com Mac"""
+        print("🌐 Configurando servidor TCP...")
+        
         try:
-            result = subprocess.run(["hciconfig"], capture_output=True, text=True)
-            for line in result.stdout.split('\n'):
-                if 'BD Address' in line:
-                    return line.split()[-1]
-        except:
-            pass
-        return "Desconhecido"
+            # Criar socket TCP
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Vincular à porta 12345
+            self.socket.bind(('0.0.0.0', 12345))
+            self.socket.listen(1)
+            
+            print("✅ Servidor TCP configurado na porta 12345")
+            print("📡 Aguardando conexão do Mac...")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Erro ao configurar servidor TCP: {e}")
+            return False
+    
+    def wait_for_connection(self):
+        """Aguarda conexão do Mac"""
+        print("\n" + "=" * 60)
+        print("🖥️  AGUARDANDO CONEXÃO DO MAC")
+        print("=" * 60)
+        
+        try:
+            # Aceitar conexão
+            self.client_socket, client_address = self.socket.accept()
+            print(f"✅ Conectado ao Mac: {client_address}")
+            
+            # Enviar mensagem de confirmação
+            self.send_to_mac({"type": "connected", "message": "Raspberry Pi Remote Ready"})
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Erro ao aguardar conexão: {e}")
+            return False
+    
+    def send_to_mac(self, data):
+        """Envia dados para o Mac via socket"""
+        if not self.client_socket:
+            return False
+        
+        try:
+            # Converter para JSON
+            json_data = json.dumps(data).encode('utf-8')
+            
+            # Enviar tamanho primeiro
+            size = struct.pack('I', len(json_data))
+            self.client_socket.send(size)
+            
+            # Enviar dados
+            self.client_socket.send(json_data)
+            return True
+            
+        except Exception as e:
+            print(f"⚠️ Erro ao enviar para Mac: {e}")
+            return False
+    
+    def create_virtual_devices(self):
+        """Cria dispositivos virtuais para capturar entrada"""
+        print("🖥️ Criando dispositivos virtuais...")
+        
+        try:
+            # Capabilities para teclado virtual
+            keyboard_cap = {
+                ecodes.EV_KEY: list(self.key_map.keys()) + list(self.modifier_map.keys())
+            }
+            
+            # Capabilities para mouse virtual
+            mouse_cap = {
+                ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+                ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL]
+            }
+            
+            # Criar dispositivos virtuais
+            self.virtual_keyboard = UInput(keyboard_cap, name='Virtual Raspberry Pi Keyboard', 
+                                          bustype=ecodes.BUS_USB, vendor=0x1, product=0x1)
+            
+            self.virtual_mouse = UInput(mouse_cap, name='Virtual Raspberry Pi Mouse', 
+                                       bustype=ecodes.BUS_USB, vendor=0x1, product=0x2)
+            
+            print("✅ Dispositivos virtuais criados")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Erro ao criar dispositivos virtuais: {e}")
+            return False
     
     def find_input_devices(self):
         """Encontra dispositivos de entrada (teclado/mouse)"""
@@ -328,11 +301,11 @@ class MacHIDController:
                 print(f"   {i}: {device.name} [{device.path}]")
                 
                 # Detecção automática
-                if not self.keyboard_device and ('keyboard' in device.name.lower() or 'Keyboard' in device.name):
+                if not self.keyboard_device and ('keyboard' in device.name.lower() or 'kbd' in device.name.lower()):
                     self.keyboard_device = device
                     print(f"     ✅ Teclado detectado")
                     
-                if not self.mouse_device and ('mouse' in device.name.lower() or 'Mouse' in device.name):
+                if not self.mouse_device and ('mouse' in device.name.lower()):
                     self.mouse_device = device
                     print(f"     ✅ Mouse detectado")
             
@@ -389,69 +362,74 @@ class MacHIDController:
             return False
     
     def process_keyboard_event(self, event):
-        """Processa eventos do teclado"""
+        """Processa eventos do teclado e envia para o Mac"""
         if event.type == ecodes.EV_KEY:
             scancode = event.code
             pressed = event.value == 1
             
-            # Modifier keys
-            if scancode in self.modifier_map:
-                if pressed:
-                    self.modifier_keys |= self.modifier_map[scancode]
-                else:
-                    self.modifier_keys &= ~self.modifier_map[scancode]
+            # Enviar evento para o Mac
+            self.send_to_mac({
+                "type": "keyboard",
+                "code": int(scancode),
+                "pressed": pressed,
+                "key_name": ecodes.KEY[scancode] if scancode in ecodes.KEY else str(scancode)
+            })
             
-            # Teclas normais
-            elif scancode in self.key_map:
-                hid_code = self.key_map[scancode]
-                
-                if pressed:
-                    # Adiciona tecla se houver espaço
-                    if hid_code not in self.keyboard_keys:
-                        for i in range(6):
-                            if self.keyboard_keys[i] == 0x00:
-                                self.keyboard_keys[i] = hid_code
-                                break
-                else:
-                    # Remove tecla
-                    for i in range(6):
-                        if self.keyboard_keys[i] == hid_code:
-                            self.keyboard_keys[i] = 0x00
+            # Simular no dispositivo virtual local (opcional)
+            if self.virtual_keyboard:
+                try:
+                    self.virtual_keyboard.write(ecodes.EV_KEY, scancode, 1 if pressed else 0)
+                    self.virtual_keyboard.syn()
+                except:
+                    pass
     
     def process_mouse_event(self, event):
-        """Processa eventos do mouse"""
+        """Processa eventos do mouse e envia para o Mac"""
         if event.type == ecodes.EV_REL:
             # Movimento do mouse
-            if event.code == ecodes.REL_X:
-                self.event_queue.put(('mouse_move', 'x', event.value))
-            elif event.code == ecodes.REL_Y:
-                self.event_queue.put(('mouse_move', 'y', event.value))
-            elif event.code == ecodes.REL_WHEEL:
-                self.event_queue.put(('mouse_wheel', event.value))
+            axis = 'x' if event.code == ecodes.REL_X else 'y' if event.code == ecodes.REL_Y else 'wheel'
+            
+            self.send_to_mac({
+                "type": "mouse_move",
+                "axis": axis,
+                "value": event.value
+            })
+            
+            # Simular no dispositivo virtual local
+            if self.virtual_mouse:
+                try:
+                    self.virtual_mouse.write(ecodes.EV_REL, event.code, event.value)
+                    self.virtual_mouse.syn()
+                except:
+                    pass
                 
         elif event.type == ecodes.EV_KEY:
             # Botões do mouse
-            pressed = event.value == 1
+            button_map = {
+                ecodes.BTN_LEFT: "left",
+                ecodes.BTN_RIGHT: "right",
+                ecodes.BTN_MIDDLE: "middle"
+            }
             
-            if event.code == ecodes.BTN_LEFT:
-                if pressed:
-                    self.mouse_buttons |= 0x01
-                else:
-                    self.mouse_buttons &= ~0x01
-            elif event.code == ecodes.BTN_RIGHT:
-                if pressed:
-                    self.mouse_buttons |= 0x02
-                else:
-                    self.mouse_buttons &= ~0x02
-            elif event.code == ecodes.BTN_MIDDLE:
-                if pressed:
-                    self.mouse_buttons |= 0x04
-                else:
-                    self.mouse_buttons &= ~0x04
+            if event.code in button_map:
+                self.send_to_mac({
+                    "type": "mouse_button",
+                    "button": button_map[event.code],
+                    "pressed": event.value == 1
+                })
+                
+                # Simular no dispositivo virtual local
+                if self.virtual_mouse:
+                    try:
+                        self.virtual_mouse.write(ecodes.EV_KEY, event.code, 1 if event.value == 1 else 0)
+                        self.virtual_mouse.syn()
+                    except:
+                        pass
     
     def keyboard_listener(self):
         """Escuta eventos do teclado"""
         if not self.keyboard_device:
+            print("⚠️ Nenhum teclado disponível para escuta")
             return
         
         print(f"🎹 Ouvindo teclado: {self.keyboard_device.name}")
@@ -467,6 +445,7 @@ class MacHIDController:
     def mouse_listener(self):
         """Escuta eventos do mouse"""
         if not self.mouse_device:
+            print("⚠️ Nenhum mouse disponível para escuta")
             return
         
         print(f"🖱️ Ouvindo mouse: {self.mouse_device.name}")
@@ -479,46 +458,61 @@ class MacHIDController:
         except Exception as e:
             print(f"⚠️ Erro no listener do mouse: {e}")
     
-    def simulate_hid_events(self):
-        """Simula entrada HID usando evdev virtual"""
-        print("🎮 Preparando para enviar entrada para o Mac...")
-        
-        # Nota: Em um sistema real, aqui você enviaria os eventos
-        # através da conexão Bluetooth HID estabelecida
-        # Esta é uma versão simplificada para demonstração
-        
-        try:
-            while self.running:
-                # Aqui você implementaria o envio real dos eventos HID
-                # através do perfil Bluetooth HID
-                time.sleep(0.01)
+    def connection_monitor(self):
+        """Monitora a conexão com o Mac"""
+        while self.running:
+            try:
+                # Testar conexão
+                if self.client_socket:
+                    # Tentar enviar ping
+                    self.send_to_mac({"type": "ping", "time": time.time()})
+                    
+                    # Verificar se socket ainda está válido
+                    ready = select.select([self.client_socket], [], [], 0.5)
+                    if ready[0]:
+                        # Tentar ler dados (deve falhar se desconectado)
+                        try:
+                            data = self.client_socket.recv(1, socket.MSG_PEEK)
+                            if data == b'':
+                                raise ConnectionError("Connection closed")
+                        except:
+                            print("❌ Conexão com Mac perdida")
+                            self.client_socket = None
+                            break
                 
-                # Exemplo: Podemos usar uinput para criar dispositivos virtuais
-                # que são então compartilhados via Bluetooth
-                pass
+                time.sleep(1)
                 
-        except Exception as e:
-            print(f"⚠️ Erro no simulador HID: {e}")
+            except Exception as e:
+                print(f"⚠️ Erro no monitor de conexão: {e}")
+                self.client_socket = None
+                break
     
     def start(self):
         """Inicia o controle remoto"""
         print("=" * 60)
-        print("🖥️  RASPBERRY PI → MAC VIA BLUETOOTH HID")
+        print("🖥️  RASPBERRY PI → MAC REMOTE CONTROL")
         print("=" * 60)
         
-        # Passo 1: Configurar Raspberry Pi como dispositivo HID
-        if not self.setup_bluetooth_hid():
-            print("❌ Falha na configuração Bluetooth HID")
+        # Passo 1: Configurar Bluetooth
+        if not self.setup_bluetooth_simple():
+            print("⚠️ Bluetooth não configurado - usando apenas TCP")
+        
+        # Passo 2: Configurar servidor TCP
+        if not self.setup_tcp_server():
+            print("❌ Falha na configuração do servidor TCP")
             return
         
-        # Passo 2: Encontrar dispositivos de entrada
+        # Passo 3: Criar dispositivos virtuais
+        self.create_virtual_devices()
+        
+        # Passo 4: Encontrar dispositivos de entrada
         devices = self.find_input_devices()
         
         if not devices:
             print("❌ Nenhum dispositivo de entrada encontrado")
             return
         
-        # Passo 3: Verificar/Selecionar dispositivos
+        # Passo 5: Verificar/Selecionar dispositivos
         if not (self.keyboard_device and self.mouse_device):
             if not self.select_input_devices(devices):
                 print("❌ Dispositivos não selecionados")
@@ -528,33 +522,42 @@ class MacHIDController:
         print(f"   Teclado: {self.keyboard_device.name}")
         print(f"   Mouse: {self.mouse_device.name}")
         
-        # Passo 4: Capturar dispositivos
+        # Passo 6: Capturar dispositivos
         if not self.grab_devices():
             print("⚠️  Dispositivos não capturados - entrada local ainda funcionará")
         
-        # Passo 5: Iniciar threads
+        # Passo 7: Aguardar conexão do Mac
+        print("\n" + "=" * 60)
+        print("📡 AGUARDANDO CONEXÃO DO MAC")
+        print("=" * 60)
+        print("\n💡 No seu Mac, execute:")
+        print("   python3 mac_client.py --host IP_DO_RASPBERRY_PI")
+        print("\n   Para descobrir o IP do Raspberry Pi:")
+        print("   hostname -I")
+        
+        if not self.wait_for_connection():
+            print("❌ Falha na conexão")
+            return
+        
+        # Passo 8: Iniciar threads
         try:
             self.running = True
             
             print("\n" + "=" * 60)
-            print("✅ PRONTO PARA CONEXÃO!")
+            print("✅ CONEXÃO ESTABELECIDA!")
             print("=" * 60)
-            print("\n📱 No seu Mac:")
-            print("   1. Abra  > Preferências do Sistema > Bluetooth")
-            print("   2. Procure por 'Raspberry Pi HID'")
-            print("   3. Clique em 'Conectar'")
-            print("\n⏳ Aguardando conexão do Mac...")
-            print("   (Esta janela ficará aberta enquanto o controle está ativo)")
+            print("\n🎮 Controle remoto ativo!")
+            print("   Todos os movimentos do teclado e mouse serão enviados para o Mac")
             print("\n🛑 Pressione Ctrl+C para parar")
             
             # Iniciar listeners em threads separadas
             keyboard_thread = threading.Thread(target=self.keyboard_listener, daemon=True)
             mouse_thread = threading.Thread(target=self.mouse_listener, daemon=True)
-            hid_thread = threading.Thread(target=self.simulate_hid_events, daemon=True)
+            monitor_thread = threading.Thread(target=self.connection_monitor, daemon=True)
             
             keyboard_thread.start()
             mouse_thread.start()
-            hid_thread.start()
+            monitor_thread.start()
             
             # Manter thread principal rodando
             while self.running:
@@ -582,23 +585,34 @@ class MacHIDController:
         except:
             pass
         
-        # Restaurar Bluetooth normal
+        # Fechar sockets
         try:
-            subprocess.run(["sudo", "hciconfig", "hci0", "nopiscan"], check=False)
-            subprocess.run(["sudo", "hciconfig", "hci0", "class", "0x000100"], check=False)
-            subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
-            print("📡 Bluetooth restaurado para modo normal")
+            if self.client_socket:
+                self.client_socket.close()
+            if self.socket:
+                self.socket.close()
+            print("🔌 Conexões fechadas")
         except:
             pass
         
-        print("\n✅ Controle encerrado. Dispositivos locais funcionando novamente.")
+        # Fechar dispositivos virtuais
+        try:
+            if self.virtual_keyboard:
+                self.virtual_keyboard.close()
+            if self.virtual_mouse:
+                self.virtual_mouse.close()
+            print("🖥️  Dispositivos virtuais fechados")
+        except:
+            pass
+        
+        print("\n✅ Controle encerrado.")
 
 def main():
     """Função principal"""
     # Verificar se está rodando como root
     if os.geteuid() != 0:
         print("❌ Este programa precisa ser executado como root!")
-        print("   Execute com: sudo python3 pi_hid_mac.py")
+        print("   Execute com: sudo python3 pi_remote.py")
         sys.exit(1)
     
     # Criar e iniciar controlador
